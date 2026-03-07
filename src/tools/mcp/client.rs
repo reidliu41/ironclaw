@@ -798,7 +798,8 @@ mod tests {
 
     #[test]
     fn test_sanitize_error_body_strips_html_tags() {
-        let html = r#"<!DOCTYPE html><html><body><h1>422 Error</h1><p>Invalid token</p></body></html>"#;
+        let html =
+            r#"<!DOCTYPE html><html><body><h1>422 Error</h1><p>Invalid token</p></body></html>"#;
         let result = sanitize_error_body(html);
         assert!(!result.contains('<'), "HTML tags must be stripped");
         assert!(!result.contains('>'), "HTML tags must be stripped");
@@ -846,7 +847,10 @@ mod tests {
     fn test_sanitize_error_body_strips_uppercase_html() {
         let html = "<HTML><BODY><H1>500 Internal Server Error</H1></BODY></HTML>";
         let result = sanitize_error_body(html);
-        assert!(!result.contains('<'), "uppercase HTML tags must be stripped");
+        assert!(
+            !result.contains('<'),
+            "uppercase HTML tags must be stripped"
+        );
         assert!(result.contains("500 Internal Server Error"));
     }
 
