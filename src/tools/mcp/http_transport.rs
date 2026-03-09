@@ -434,7 +434,7 @@ mod tests {
 
         let request = McpRequest {
             jsonrpc: "2.0".to_string(),
-            id: 1,
+            id: Some(1),
             method: "initialize".to_string(),
             params: Some(serde_json::json!({})),
         };
@@ -466,7 +466,7 @@ mod tests {
         )]);
         let request = McpRequest {
             jsonrpc: "2.0".to_string(),
-            id: 1,
+            id: Some(1),
             method: "initialize".to_string(),
             params: Some(serde_json::json!({})),
         };
@@ -491,7 +491,7 @@ mod tests {
         let per_request = HashMap::new(); // no per-request auth
         let request = McpRequest {
             jsonrpc: "2.0".to_string(),
-            id: 1,
+            id: Some(1),
             method: "initialize".to_string(),
             params: Some(serde_json::json!({})),
         };
