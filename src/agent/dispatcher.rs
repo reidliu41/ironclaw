@@ -515,24 +515,16 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         content: Option<String>,
         reason_ctx: &mut ReasoningContext,
     ) -> Result<Option<LoopOutcome>, Error> {
-        // G4: check content before it's moved into assistant_with_tool_calls
-        let has_nonempty_content = content
-            .as_deref()
-            .filter(|t| !t.trim().is_empty())
-            .is_some();
-
         // Extract and sanitize the narrative before consuming `content`.
-        let narrative = content
-            .as_deref()
-            .filter(|c| !c.trim().is_empty())
-            .map(|c| {
-                let sanitized = self
-                    .agent
+        // G4: gate communication recording on sanitized text, not raw content.
+        let narrative =
+            crate::agent::drift_monitor::visible_sanitized_content(content.as_deref(), |c| {
+                self.agent
                     .safety()
-                    .sanitize_tool_output("agent_narrative", c);
-                sanitized.content
-            })
-            .filter(|c| !c.trim().is_empty());
+                    .sanitize_tool_output("agent_narrative", c)
+                    .content
+            });
+        let has_nonempty_content = narrative.is_some();
 
         // Add the assistant message with tool_calls to context.
         // OpenAI protocol requires this before tool-result messages.

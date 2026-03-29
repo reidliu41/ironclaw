@@ -1579,11 +1579,6 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
 
         // Strip suggestions from accompanying text (not useful in job context).
         let content = content.map(|c| crate::agent::strip_suggestions(&c));
-        // G4: check content before it's moved
-        let has_nonempty_content = content
-            .as_deref()
-            .filter(|t| !t.trim().is_empty())
-            .is_some();
 
         if let Some(ref text) = content {
             self.worker.log_event(
@@ -1596,20 +1591,18 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         }
 
         // Emit reasoning event if any tool calls carry reasoning.
-        // Sanitize narrative and per-tool rationale through SafetyLayer
-        // (parity with ChatDelegate in dispatcher.rs).
-        let sanitized_narrative = content
-            .as_deref()
-            .filter(|c| !c.trim().is_empty())
-            .map(|c| {
+        // Sanitize narrative and per-tool rationale through SafetyLayer.
+        // G4: gate communication recording on sanitized text, not raw content.
+        let sanitized_narrative_opt =
+            crate::agent::drift_monitor::visible_sanitized_content(content.as_deref(), |c| {
                 self.worker
                     .deps
                     .safety
                     .sanitize_tool_output("job_narrative", c)
                     .content
-            })
-            .filter(|c| !c.trim().is_empty())
-            .unwrap_or_default();
+            });
+        let has_nonempty_content = sanitized_narrative_opt.is_some();
+        let sanitized_narrative = sanitized_narrative_opt.unwrap_or_default();
         let decisions: Vec<serde_json::Value> = tool_calls
             .iter()
             .filter_map(|tc| {
@@ -2337,6 +2330,10 @@ mod tests {
             consecutive_rate_limits: std::sync::atomic::AtomicUsize::new(0),
             recovery_state: tokio::sync::Mutex::new(AutonomousRecoveryState::default()),
             has_text_response: std::sync::atomic::AtomicBool::new(false),
+            drift_monitor: tokio::sync::Mutex::new(
+                crate::agent::drift_monitor::DriftMonitor::disabled(),
+            ),
+            current_iteration: std::sync::atomic::AtomicUsize::new(0),
         };
 
         let mut reason_ctx = ReasoningContext::new();

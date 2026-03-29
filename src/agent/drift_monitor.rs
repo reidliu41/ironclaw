@@ -130,7 +130,6 @@ struct ToolCallRecord {
     name: String,
     arguments_hash: u64,
     succeeded: bool,
-    iteration: usize,
 }
 
 /// Detects common failure patterns in the agentic loop and produces
@@ -145,6 +144,22 @@ pub struct DriftMonitor {
     max_history: usize,
     iterations_since_communication: usize,
     suppressed: HashSet<DriftCorrectionKind>,
+    /// Per-iteration tool sequence for cycling detection. Deliberately
+    /// tracks the first tool recorded in each iteration. Capped at
+    /// `iteration_tools_cap` (`max(cycling_window, 3)`) — detection
+    /// reads the last `cycling_window` entries, recovery reads the
+    /// last 3. Decoupled from `history` so multi-tool iterations
+    /// don't shrink the effective iteration window.
+    iteration_tools: VecDeque<String>,
+    /// Maximum retained entries in `iteration_tools`.
+    /// `max(cycling_window, 3)` — detection needs `cycling_window`,
+    /// recovery needs 3.
+    iteration_tools_cap: usize,
+    /// Last iteration number recorded in `iteration_tools`.
+    /// `None` means no iteration has been recorded yet. This is a
+    /// defensive guard — `record_tool_calls()` is called once per
+    /// iteration by convention, but the type system doesn't enforce it.
+    last_cycling_iteration: Option<usize>,
 }
 
 impl DriftMonitor {
@@ -152,14 +167,17 @@ impl DriftMonitor {
     pub fn new(config: DriftConfig) -> Self {
         let max_history = config
             .repetition_window
-            .max(config.cycling_window)
             .max(config.failure_spiral_threshold);
+        let iteration_tools_cap = config.cycling_window.max(3);
         Self {
             config,
             history: VecDeque::with_capacity(max_history + 1),
             max_history,
             iterations_since_communication: 0,
             suppressed: HashSet::new(),
+            iteration_tools: VecDeque::with_capacity(iteration_tools_cap + 1),
+            iteration_tools_cap,
+            last_cycling_iteration: None,
         }
     }
 
@@ -186,7 +204,6 @@ impl DriftMonitor {
                 name: name.clone(),
                 arguments_hash: *args_hash,
                 succeeded: *succeeded,
-                iteration,
             };
 
             // Check recovery events before inserting
@@ -201,14 +218,6 @@ impl DriftMonitor {
                 self.suppressed.remove(&DriftCorrectionKind::Repetition);
             }
 
-            // Non-alternating call clears cycling suppression
-            if self.history.len() >= 2 {
-                let prev = &self.history[self.history.len() - 2];
-                if record.name != prev.name {
-                    self.suppressed.remove(&DriftCorrectionKind::ToolCycling);
-                }
-            }
-
             self.history.push_back(record);
             if self.history.len() > self.max_history {
                 self.history.pop_front();
@@ -217,6 +226,31 @@ impl DriftMonitor {
 
         // Silence: one increment per iteration, not per tool
         self.iterations_since_communication += 1;
+
+        // Per-iteration cycling tracking. Deliberately records the first
+        // tool of each iteration — this is a design choice, not an accident.
+        // Defensive: even if record_tool_calls() is called multiple times
+        // for the same iteration, only the first call inserts.
+        if Some(iteration) != self.last_cycling_iteration
+            && let Some((name, _, _)) = calls.first()
+        {
+            self.iteration_tools.push_back(name.clone());
+            if self.iteration_tools.len() > self.iteration_tools_cap {
+                self.iteration_tools.pop_front();
+            }
+            self.last_cycling_iteration = Some(iteration);
+
+            // Cycling recovery: if the latest iteration-level tool breaks
+            // the A-B alternation pattern, clear cycling suppression.
+            // In a cycling pattern X-Y-X, tools[n] == tools[n-2].
+            // If that no longer holds, the pattern is broken.
+            if self.iteration_tools.len() >= 3 {
+                let len = self.iteration_tools.len();
+                if self.iteration_tools[len - 1] != self.iteration_tools[len - 3] {
+                    self.suppressed.remove(&DriftCorrectionKind::ToolCycling);
+                }
+            }
+        }
     }
 
     /// Record that visible text was communicated to the user.
@@ -247,10 +281,13 @@ impl DriftMonitor {
         for detect in detectors {
             if let Some(correction) = detect(self) {
                 let kind = correction.kind();
-                if !self.suppressed.contains(&kind) {
-                    self.suppressed.insert(kind);
-                    return Some(correction);
+                if self.suppressed.contains(&kind) {
+                    // High-priority match is suppressed — block all lower-priority
+                    // detectors to prevent stacking corrections from one incident.
+                    return None;
                 }
+                self.suppressed.insert(kind);
+                return Some(correction);
             }
         }
 
@@ -323,33 +360,22 @@ impl DriftMonitor {
 
     fn detect_cycling(&self) -> Option<DriftCorrection> {
         let window = self.config.cycling_window;
-        if self.history.len() < window {
+        if self.iteration_tools.len() < window {
             return None;
         }
 
-        // Extract cross-iteration tool name sequence (deduplicate within
-        // the same iteration to avoid false positives from multi-tool calls)
-        let start = self.history.len().saturating_sub(window * 2);
-        let mut cross_iter_names: Vec<&str> = Vec::new();
-        let mut last_iteration = usize::MAX;
+        let start = self.iteration_tools.len() - window;
+        let check: Vec<&str> = self
+            .iteration_tools
+            .range(start..)
+            .map(|s| s.as_str())
+            .collect();
 
-        for record in self.history.range(start..) {
-            if record.iteration != last_iteration {
-                cross_iter_names.push(&record.name);
-                last_iteration = record.iteration;
-            }
-        }
-
-        // Need at least `window` cross-iteration entries to detect A-B-A-B
-        if cross_iter_names.len() < window {
-            return None;
-        }
-
-        // Check the last `window` entries for strict A-B alternation
-        let check = &cross_iter_names[cross_iter_names.len() - window..];
+        // Guard: need at least 2 entries for A-B pattern
         if check.len() < 2 {
             return None;
         }
+
         let a = check[0];
         let b = check[1];
         if a == b {
@@ -389,6 +415,26 @@ pub fn hash_arguments(v: &serde_json::Value) -> u64 {
     let s = serde_json::to_string(v).unwrap_or_default();
     s.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Determine whether content accompanying tool calls counts as visible
+/// communication for drift detection purposes.
+///
+/// Returns the sanitized text if it is non-empty after trimming, or `None`
+/// if there is no visible content (raw is empty/whitespace, or sanitization
+/// produces empty/whitespace output).
+///
+/// All three delegates (chat, job, container) must use this function to
+/// gate `record_communication()` — structural parity is ensured by having
+/// a single implementation.
+pub fn visible_sanitized_content(
+    content: Option<&str>,
+    sanitize: impl FnOnce(&str) -> String,
+) -> Option<String> {
+    content
+        .filter(|c| !c.trim().is_empty())
+        .map(sanitize)
+        .filter(|c| !c.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -794,5 +840,135 @@ mod tests {
             m.check_and_mark().is_none(),
             "2 executed failures + 1 unrecorded rejection should not trigger spiral"
         );
+    }
+
+    /// Regression: a suppressed high-priority detector must block lower-priority
+    /// detectors from firing on the same unchanged history. Without this fix,
+    /// FailureSpiral suppression lets Repetition leak through on the next check.
+    #[test]
+    fn test_suppressed_high_priority_blocks_lower() {
+        let mut m = DriftMonitor::new(DriftConfig {
+            failure_spiral_threshold: 3,
+            repetition_threshold: 3,
+            ..make_config()
+        });
+        record(&mut m, "cmd", 42, false, 1);
+        record(&mut m, "cmd", 42, false, 2);
+        record(&mut m, "cmd", 42, false, 3);
+
+        // First check: FailureSpiral fires (higher priority)
+        let c = m.check_and_mark().unwrap();
+        assert!(matches!(c, DriftCorrection::FailureSpiral { .. }));
+
+        // No new records, no recovery — identical unchanged history.
+        // Must return None, not leak to Repetition.
+        assert!(
+            m.check_and_mark().is_none(),
+            "suppressed FailureSpiral on unchanged history must block lower-priority Repetition"
+        );
+    }
+
+    /// Regression: cycling detection must work when iterations contain multiple
+    /// tool calls. The per-iteration history tracks the first tool of each
+    /// iteration, independent of the raw tool-call ring buffer size.
+    #[test]
+    fn test_cycling_detected_with_multi_tool_iterations() {
+        let mut m = DriftMonitor::new(DriftConfig {
+            repetition_threshold: 100, // disable
+            ..make_config()
+        });
+        // 6 iterations, each with 3 tool calls.
+        // First tool alternates A-B-A-B-A-B across iterations.
+        for i in 1..=6 {
+            let first = if i % 2 == 1 { "tool_a" } else { "tool_b" };
+            m.record_tool_calls(
+                &[
+                    (first.to_string(), i as u64, true),
+                    ("helper_1".to_string(), 100, true),
+                    ("helper_2".to_string(), 200, true),
+                ],
+                i,
+            );
+        }
+
+        let correction = m.check_and_mark();
+        assert!(
+            matches!(correction, Some(DriftCorrection::ToolCycling { .. })),
+            "cycling must be detected despite 3 tools per iteration"
+        );
+    }
+
+    /// Regression: ToolCycling suppression must clear when the alternation
+    /// pattern is broken, allowing re-detection of a new cycling pattern.
+    /// Covers the full lifecycle: fire -> suppress -> verify blocked -> break
+    /// pattern -> re-establish -> fire again.
+    #[test]
+    fn test_cycling_suppression_clears_on_broken_pattern() {
+        let mut m = DriftMonitor::new(DriftConfig {
+            repetition_threshold: 100,     // disable
+            failure_spiral_threshold: 100, // disable
+            ..make_config()
+        });
+        // A-B alternation for 6 iterations -> cycling fires
+        for i in 1..=6 {
+            let tool = if i % 2 == 1 { "tool_a" } else { "tool_b" };
+            record(&mut m, tool, i as u64, true, i);
+        }
+        assert!(matches!(
+            m.check_and_mark(),
+            Some(DriftCorrection::ToolCycling { .. })
+        ));
+
+        // Suppressed: same pattern continues but check returns None
+        record(&mut m, "tool_a", 80, true, 7);
+        assert!(
+            m.check_and_mark().is_none(),
+            "cycling must be suppressed before recovery"
+        );
+
+        // Break the pattern with a different tool
+        record(&mut m, "tool_c", 70, true, 8);
+
+        // New A-B cycling
+        for i in 9..=14 {
+            let tool = if i % 2 == 1 { "tool_a" } else { "tool_b" };
+            record(&mut m, tool, i as u64, true, i);
+        }
+        assert!(
+            matches!(
+                m.check_and_mark(),
+                Some(DriftCorrection::ToolCycling { .. })
+            ),
+            "cycling must re-trigger after pattern was broken and re-established"
+        );
+    }
+
+    // --- visible_sanitized_content tests ---
+
+    #[test]
+    fn test_visible_sanitized_content_none_input() {
+        assert!(visible_sanitized_content(None, |c| c.to_string()).is_none());
+    }
+
+    #[test]
+    fn test_visible_sanitized_content_whitespace_input() {
+        assert!(visible_sanitized_content(Some("   "), |c| c.to_string()).is_none());
+    }
+
+    #[test]
+    fn test_visible_sanitized_content_raw_nonempty_sanitize_to_empty() {
+        // Reviewer's exact scenario: raw non-empty but sanitizer strips it
+        assert!(visible_sanitized_content(Some("leaked markers"), |_| String::new()).is_none());
+    }
+
+    #[test]
+    fn test_visible_sanitized_content_raw_nonempty_sanitize_to_whitespace() {
+        assert!(visible_sanitized_content(Some("leaked markers"), |_| "   ".to_string()).is_none());
+    }
+
+    #[test]
+    fn test_visible_sanitized_content_raw_nonempty_sanitize_preserves() {
+        let result = visible_sanitized_content(Some("hello"), |c| c.to_uppercase());
+        assert_eq!(result.as_deref(), Some("HELLO"));
     }
 }
