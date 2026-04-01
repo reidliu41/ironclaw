@@ -138,6 +138,8 @@ Configurable via `HTTP_HOST` (default `0.0.0.0`) and `HTTP_PORT` (default `8080`
 
 **WARNING:** The default bind address is `0.0.0.0`, meaning the webhook server listens on **all interfaces** by default. This is intentional (webhooks must be reachable from external services like Telegram/Slack), but operators should be aware of the exposure.
 
+**`--cli-only` mode:** When the `--cli-only` flag is set, all non-CLI ingress listeners are suppressed — no webhook server, WASM channel endpoints, HTTP channel, Signal channel, gateway channel, managed tunnel, or sandbox orchestrator API will start.
+
 **Reference:** `src/config.rs` — `http_host` default (`"0.0.0.0"`), `http_port` default (`8080`)
 
 ### Authentication

@@ -83,8 +83,16 @@ fn format_top_level_error(err: &anyhow::Error) {
     eprintln!();
 }
 
+/// Returns `true` when non-CLI network services should be enabled.
+/// `--cli-only` suppresses all of them: webhooks, WASM channels, HTTP,
+/// Signal, gateway, managed tunnel, and sandbox orchestrator API.
+fn non_cli_channels_enabled(cli_only: bool) -> bool {
+    !cli_only
+}
+
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let enable_non_cli = non_cli_channels_enabled(cli.cli_only);
 
     // Handle non-agent commands first (they don't need full setup)
     match &cli.command {
@@ -350,21 +358,39 @@ async fn async_main() -> anyhow::Result<()> {
 
     // ── Tunnel setup ───────────────────────────────────────────────────
 
-    let (config, active_tunnel) = ironclaw::tunnel::start_managed_tunnel(config).await;
+    let (config, active_tunnel) = if enable_non_cli {
+        ironclaw::tunnel::start_managed_tunnel(config).await
+    } else {
+        (config, None)
+    };
 
     // ── Orchestrator / container job manager ────────────────────────────
+    // Orchestrator starts an internal HTTP API (default 0.0.0.0:50051) for
+    // sandbox worker communication.  Skip it entirely under --cli-only to
+    // honour the "no network listeners" contract.
 
-    let orch = ironclaw::orchestrator::setup_orchestrator(
-        &config,
-        &components.llm,
-        components.db.as_ref(),
-        components.secrets_store.as_ref(),
-    )
-    .await;
-    let container_job_manager = orch.container_job_manager;
-    let job_event_tx = orch.job_event_tx;
-    let prompt_queue = orch.prompt_queue;
-    let docker_status = orch.docker_status;
+    let (container_job_manager, job_event_tx, prompt_queue, docker_status) = if enable_non_cli {
+        let orch = ironclaw::orchestrator::setup_orchestrator(
+            &config,
+            &components.llm,
+            components.db.as_ref(),
+            components.secrets_store.as_ref(),
+        )
+        .await;
+        (
+            orch.container_job_manager,
+            orch.job_event_tx,
+            orch.prompt_queue,
+            orch.docker_status,
+        )
+    } else {
+        (
+            None,
+            None,
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            ironclaw::sandbox::DockerStatus::Disabled,
+        )
+    };
 
     // Derive user-facing warning from docker_status for channel notification
     let docker_user_warning: Option<String> = match docker_status {
@@ -424,17 +450,20 @@ async fn async_main() -> anyhow::Result<()> {
     // Collect webhook route fragments; a single WebhookServer hosts them all.
     let mut webhook_routes: Vec<axum::Router> = Vec::new();
 
-    webhook_routes.push(webhooks::routes(ToolWebhookState {
-        tools: Arc::clone(&components.tools),
-        routine_engine: Arc::clone(&shared_routine_engine_slot),
-        user_id: config.owner_id.clone(),
-        secrets_store: components.secrets_store.clone(),
-    }));
+    if enable_non_cli {
+        webhook_routes.push(webhooks::routes(ToolWebhookState {
+            tools: Arc::clone(&components.tools),
+            routine_engine: Arc::clone(&shared_routine_engine_slot),
+            user_id: config.owner_id.clone(),
+            secrets_store: components.secrets_store.clone(),
+        }));
+    }
 
     // Load WASM channels and register their webhook routes.
     // Ensure the channels directory exists so the WASM runtime initializes even when
     // no channels are installed yet — hot-activation needs the runtime to be available.
-    if config.channels.wasm_channels_enabled
+    if enable_non_cli
+        && config.channels.wasm_channels_enabled
         && let Err(e) = std::fs::create_dir_all(&config.channels.wasm_channels_dir)
     {
         tracing::warn!(
@@ -443,7 +472,10 @@ async fn async_main() -> anyhow::Result<()> {
             "Failed to create WASM channels directory"
         );
     }
-    if config.channels.wasm_channels_enabled && config.channels.wasm_channels_dir.exists() {
+    if enable_non_cli
+        && config.channels.wasm_channels_enabled
+        && config.channels.wasm_channels_dir.exists()
+    {
         let wasm_result = ironclaw::channels::wasm::setup_wasm_channels(
             &config,
             &components.secrets_store,
@@ -471,9 +503,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Add Signal channel if configured and not CLI-only mode.
-    if !cli.cli_only
-        && let Some(ref signal_config) = config.channels.signal
-    {
+    if enable_non_cli && let Some(ref signal_config) = config.channels.signal {
         let signal_channel = SignalChannel::new(signal_config.clone())?;
         channel_names.push("signal".to_string());
         channels.add(Box::new(signal_channel)).await;
@@ -493,9 +523,7 @@ async fn async_main() -> anyhow::Result<()> {
     let mut webhook_server_addr: Option<std::net::SocketAddr> = None;
     #[cfg(unix)]
     let mut http_channel_state: Option<Arc<ironclaw::channels::HttpChannelState>> = None;
-    if !cli.cli_only
-        && let Some(ref http_config) = config.channels.http
-    {
+    if enable_non_cli && let Some(ref http_config) = config.channels.http {
         let http_channel = HttpChannel::new(http_config.clone());
         #[cfg(unix)]
         {
@@ -579,7 +607,7 @@ async fn async_main() -> anyhow::Result<()> {
         components.db.clone(),
         job_event_tx.clone(),
         Some(channels.inject_sender()),
-        if config.sandbox.enabled {
+        if config.sandbox.enabled && container_job_manager.is_some() {
             Some(Arc::clone(&prompt_queue))
         } else {
             None
@@ -591,7 +619,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     let mut gateway_url: Option<String> = None;
     let mut sse_manager: Option<std::sync::Arc<ironclaw::channels::web::sse::SseManager>> = None;
-    if let Some(ref gw_config) = config.channels.gateway {
+    if enable_non_cli && let Some(ref gw_config) = config.channels.gateway {
         let mut gw = GatewayChannel::new(gw_config.clone(), config.owner_id.clone());
         gw = gw.with_llm_provider(Arc::clone(&components.llm));
         if let Some(ref ws) = components.workspace {
@@ -932,7 +960,9 @@ async fn async_main() -> anyhow::Result<()> {
         document_extraction: Some(Arc::new(
             ironclaw::document_extraction::DocumentExtractionMiddleware::new(),
         )),
-        sandbox_readiness: if !config.sandbox.enabled {
+        sandbox_readiness: if !config.sandbox.enabled
+            || matches!(docker_status, ironclaw::sandbox::DockerStatus::Disabled)
+        {
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig
         } else if docker_status.is_ok() {
             ironclaw::agent::routine_engine::SandboxReadiness::Available
@@ -1215,4 +1245,76 @@ async fn async_main() -> anyhow::Result<()> {
     tracing::debug!("Agent shutdown complete");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::non_cli_channels_enabled;
+
+    /// Regression test for <https://github.com/nearai/ironclaw/issues/1840>:
+    /// `--cli-only` must suppress webhook server and all non-CLI channels.
+    #[test]
+    fn cli_only_disables_non_cli_channels() {
+        assert!(
+            !non_cli_channels_enabled(true),
+            "--cli-only should disable non-CLI channels"
+        );
+        assert!(
+            non_cli_channels_enabled(false),
+            "default mode should enable non-CLI channels"
+        );
+    }
+
+    /// Source-level guard: every network-facing startup call in `async_main`
+    /// must be gated behind `enable_non_cli`.  If someone adds a new channel
+    /// or tunnel call without the guard, this test fails.
+    ///
+    /// Regression coverage for <https://github.com/nearai/ironclaw/issues/1840>.
+    #[test]
+    fn all_non_cli_ingress_paths_are_guarded() {
+        let source = include_str!("main.rs");
+
+        // Extract the body of async_main (from its signature to the end of file,
+        // minus the test module).  Good enough for a structural grep.
+        let async_main_body = source
+            .split_once("async fn async_main(")
+            .expect("async_main not found")
+            .1;
+        let async_main_body = async_main_body
+            .split_once("#[cfg(test)]")
+            .map_or(async_main_body, |(body, _)| body);
+
+        // Calls that MUST be behind an `enable_non_cli` guard.
+        // When adding a new channel, tunnel, or network-facing service,
+        // add its startup call here so this test catches missing guards.
+        let guarded_calls = &[
+            "setup_orchestrator(",
+            "webhooks::routes(",
+            "setup_wasm_channels(",
+            "SignalChannel::new(",
+            "HttpChannel::new(",
+            "GatewayChannel::new(",
+            "start_managed_tunnel(",
+        ];
+
+        for call in guarded_calls {
+            // Find every occurrence of the call and verify that `enable_non_cli`
+            // appears in the preceding 500 chars (i.e. the enclosing `if` block).
+            let mut search_from = 0;
+            while let Some(pos) = async_main_body[search_from..].find(call) {
+                let abs = search_from + pos;
+                let window_start = abs.saturating_sub(500);
+                let window = &async_main_body[window_start..abs];
+                assert!(
+                    window.contains("enable_non_cli"),
+                    "Network ingress call `{}` at byte offset {} in async_main is not \
+                     guarded by `enable_non_cli`. Every non-CLI startup path must check \
+                     this flag (issue #1840).",
+                    call,
+                    abs,
+                );
+                search_from = abs + call.len();
+            }
+        }
+    }
 }
