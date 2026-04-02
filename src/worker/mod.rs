@@ -171,8 +171,8 @@ fn resolve_drift_config() -> crate::agent::drift_monitor::DriftConfig {
     }
 }
 
-fn resolve_drift_config_inner(
-) -> Result<crate::agent::drift_monitor::DriftConfig, crate::error::ConfigError> {
+fn resolve_drift_config_inner()
+-> Result<crate::agent::drift_monitor::DriftConfig, crate::error::ConfigError> {
     use crate::agent::drift_monitor::DriftConfig;
     use crate::config::helpers::{parse_bool_env, parse_optional_env};
 
