@@ -20,7 +20,7 @@ use crate::context::JobContext;
 use crate::llm::recording::{HttpExchangeRequest, HttpExchangeResponse, HttpInterceptor};
 use crate::safety::LeakDetector;
 use crate::secrets::{DecryptedSecret, SecretsStore};
-use crate::tools::tool::{Tool, ToolError, ToolOutput};
+use crate::tools::tool::{Tool, ToolDiscoverySummary, ToolError, ToolOutput};
 use crate::tools::wasm::capabilities::Capabilities;
 use crate::tools::wasm::credential_injector::{
     InjectedCredentials, host_matches_pattern, inject_credential,
@@ -431,12 +431,14 @@ impl near::agent::host::Host for StoreData {
                 _ => return Err(format!("Unsupported HTTP method: {}", method)),
             };
 
-            for (key, value) in headers {
-                request = request.header(&key, &value);
+            for (key, value) in &headers {
+                request = request.header(key, value);
             }
 
             if let Some(body_bytes) = body {
                 request = request.body(body_bytes);
+            } else if needs_content_length_zero(&method, &headers) {
+                request = request.header("content-length", "0");
             }
 
             // Caller-specified timeout (default 30s, max 5min)
@@ -583,6 +585,8 @@ pub struct WasmToolWrapper {
     description: String,
     /// Compact and discovery schemas for this tool.
     schemas: WasmToolSchemas,
+    /// Optional curated discovery guidance surfaced by `tool_info`.
+    discovery_summary: Option<ToolDiscoverySummary>,
     /// Injected credentials for HTTP requests (e.g., OAuth tokens).
     /// Keys are placeholder names like "GOOGLE_ACCESS_TOKEN".
     credentials: HashMap<String, String>,
@@ -834,6 +838,7 @@ impl WasmToolWrapper {
         Self {
             description: prepared.description.clone(),
             schemas: WasmToolSchemas::new(prepared.schema.clone()),
+            discovery_summary: None,
             runtime,
             prepared,
             capabilities,
@@ -877,6 +882,12 @@ impl WasmToolWrapper {
         } else {
             self.schemas = self.schemas.with_override(schema);
         }
+        self
+    }
+
+    /// Override the curated discovery summary.
+    pub fn with_discovery_summary(mut self, summary: ToolDiscoverySummary) -> Self {
+        self.discovery_summary = Some(summary);
         self
     }
 
@@ -1096,6 +1107,10 @@ impl Tool for WasmToolWrapper {
         self.schemas.discovery()
     }
 
+    fn discovery_summary(&self) -> Option<ToolDiscoverySummary> {
+        self.discovery_summary.clone()
+    }
+
     /// Compose the tool schema for LLM function calling.
     ///
     /// When the advertised schema is permissive (no typed properties), appends
@@ -1147,6 +1162,7 @@ impl Tool for WasmToolWrapper {
         let capabilities = self.capabilities.clone();
         let description = self.description.clone();
         let schemas = self.schemas.clone();
+        let discovery_summary = self.discovery_summary.clone();
         let credentials = self.credentials.clone();
 
         // Execute in blocking task with timeout
@@ -1157,6 +1173,7 @@ impl Tool for WasmToolWrapper {
                 capabilities,
                 description,
                 schemas,
+                discovery_summary,
                 credentials,
                 secrets_store: None, // Not needed in blocking task
                 oauth_refresh: None, // Already used above for pre-refresh
@@ -1264,6 +1281,7 @@ async fn refresh_oauth_token(
                 client_id: &config.client_id,
                 client_secret: config.client_secret.as_deref(),
                 refresh_token: refresh_secret.expose(),
+                resource: None,
                 provider: config.provider.as_deref(),
             },
         )
@@ -1362,6 +1380,14 @@ async fn refresh_oauth_token(
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             expires_in: token_data.get("expires_in").and_then(|v| v.as_u64()),
+            token_type: token_data
+                .get("token_type")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            scope: token_data
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         },
         None => {
             tracing::warn!("Token refresh response missing access_token field");
@@ -1758,6 +1784,20 @@ fn build_tool_usage_hint(tool_name: &str, schema: &serde_json::Value) -> String 
     }
 
     hint
+}
+
+/// Methods with side effects require `Content-Length` even when no body is
+/// sent — some APIs (e.g. Gmail) return 411 without it. Returns `true` when
+/// the host should inject a `Content-Length: 0` header.
+fn needs_content_length_zero(method: &str, headers: &HashMap<String, String>) -> bool {
+    let mutating = method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("PATCH")
+        || method.eq_ignore_ascii_case("DELETE");
+    mutating
+        && !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
 }
 
 #[cfg(test)]
@@ -3033,6 +3073,27 @@ mod tests {
         assert_eq!(wrapper.discovery_schema(), typed_schema); // safety: test-only assertion
     }
 
+    #[tokio::test]
+    async fn test_wrapper_returns_curated_discovery_summary() {
+        let runtime = Arc::new(WasmToolRuntime::new(WasmRuntimeConfig::for_testing()).unwrap()); // safety: test-only setup
+        let prepared = runtime
+            .prepare("github", b"\0asm\x0d\0\x01\0", None)
+            .await
+            .unwrap(); // safety: test-only setup
+
+        let summary = crate::tools::tool::ToolDiscoverySummary {
+            always_required: vec!["action".into()],
+            notes: vec!["Use tool_info for the full schema".into()],
+            ..crate::tools::tool::ToolDiscoverySummary::default()
+        };
+
+        let wrapper =
+            super::WasmToolWrapper::new(Arc::clone(&runtime), prepared, Capabilities::default())
+                .with_discovery_summary(summary.clone());
+
+        assert_eq!(wrapper.discovery_summary(), Some(summary));
+    }
+
     #[test]
     fn test_build_tool_usage_hint_detects_nullable_container_properties() {
         let schema = serde_json::json!({
@@ -3258,5 +3319,58 @@ mod tests {
 
         // Should return empty since credential can't be found anywhere
         assert!(result.is_empty(), "no credentials found"); // safety: test code only
+    }
+
+    // --- needs_content_length_zero (regression for #1529) ---
+
+    #[test]
+    fn post_no_body_needs_content_length() {
+        let headers = HashMap::new();
+        assert!(
+            super::needs_content_length_zero("POST", &headers),
+            "POST with no body must get Content-Length: 0 to avoid 411"
+        );
+    }
+
+    #[test]
+    fn put_no_body_needs_content_length() {
+        assert!(super::needs_content_length_zero("PUT", &HashMap::new()));
+    }
+
+    #[test]
+    fn delete_no_body_needs_content_length() {
+        assert!(super::needs_content_length_zero("DELETE", &HashMap::new()));
+    }
+
+    #[test]
+    fn patch_no_body_needs_content_length() {
+        assert!(super::needs_content_length_zero("PATCH", &HashMap::new()));
+    }
+
+    #[test]
+    fn get_no_body_skips_content_length() {
+        assert!(!super::needs_content_length_zero("GET", &HashMap::new()));
+    }
+
+    #[test]
+    fn head_no_body_skips_content_length() {
+        assert!(!super::needs_content_length_zero("HEAD", &HashMap::new()));
+    }
+
+    #[test]
+    fn post_no_body_respects_explicit_content_length() {
+        let mut headers = HashMap::new();
+        headers.insert("Content-Length".to_string(), "0".to_string());
+        assert!(
+            !super::needs_content_length_zero("POST", &headers),
+            "should not double-add when tool already sets Content-Length"
+        );
+    }
+
+    #[test]
+    fn content_length_check_is_case_insensitive() {
+        let mut headers = HashMap::new();
+        headers.insert("content-length".to_string(), "0".to_string());
+        assert!(!super::needs_content_length_zero("POST", &headers));
     }
 }

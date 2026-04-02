@@ -1800,7 +1800,7 @@ impl WasmChannel {
 
         let runtime = Arc::clone(&self.runtime);
         let prepared = Arc::clone(&self.prepared);
-        let capabilities = self.capabilities.clone();
+        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
@@ -1811,6 +1811,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let workspace_store = self.workspace_store.clone();
 
         // Prepare response data
         let message_id_str = message_id.to_string();
@@ -1881,8 +1882,10 @@ impl WasmChannel {
                     });
                 }
 
-                let host_state =
+                let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                let pending_writes = host_state.take_pending_writes();
+                workspace_store.commit_writes(&pending_writes);
                 tracing::info!("on_respond WASM execution completed successfully");
                 Ok(((), host_state))
             })
@@ -1944,7 +1947,7 @@ impl WasmChannel {
 
         let runtime = Arc::clone(&self.runtime);
         let prepared = Arc::clone(&self.prepared);
-        let capabilities = self.capabilities.clone();
+        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
@@ -1955,6 +1958,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let workspace_store = self.workspace_store.clone();
 
         let user_id = user_id.to_string();
         let content = content.to_string();
@@ -2006,8 +2010,10 @@ impl WasmChannel {
                     });
                 }
 
-                let host_state =
+                let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                let pending_writes = host_state.take_pending_writes();
+                workspace_store.commit_writes(&pending_writes);
                 tracing::info!("on_broadcast WASM execution completed successfully");
                 Ok(((), host_state))
             })
@@ -2051,7 +2057,7 @@ impl WasmChannel {
 
         let runtime = Arc::clone(&self.runtime);
         let prepared = Arc::clone(&self.prepared);
-        let capabilities = self.capabilities.clone();
+        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
@@ -2062,6 +2068,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let workspace_store = self.workspace_store.clone();
 
         let Some(wit_update) = status_to_wit(status, metadata) else {
             return Ok(());
@@ -2083,6 +2090,11 @@ impl WasmChannel {
                 channel_iface
                     .call_on_status(&mut store, &wit_update)
                     .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
+
+                let mut host_state =
+                    Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                let pending_writes = host_state.take_pending_writes();
+                workspace_store.commit_writes(&pending_writes);
 
                 Ok(())
             })
@@ -2124,6 +2136,7 @@ impl WasmChannel {
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
         timeout: Duration,
+        workspace_store: &Arc<ChannelWorkspaceStore>,
         wit_update: wit_channel::StatusUpdate,
     ) -> Result<(), WasmChannelError> {
         if prepared.component().is_none() {
@@ -2132,9 +2145,10 @@ impl WasmChannel {
 
         let runtime = Arc::clone(runtime);
         let prepared = Arc::clone(prepared);
-        let capabilities = capabilities.clone();
+        let capabilities = Self::inject_workspace_reader(capabilities, workspace_store);
         let credentials_snapshot = credentials.read().await.clone();
         let channel_name_owned = channel_name.to_string();
+        let workspace_store = Arc::clone(workspace_store);
 
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
@@ -2152,6 +2166,11 @@ impl WasmChannel {
                 channel_iface
                     .call_on_status(&mut store, &wit_update)
                     .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
+
+                let mut host_state =
+                    Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                let pending_writes = host_state.take_pending_writes();
+                workspace_store.commit_writes(&pending_writes);
 
                 Ok(())
             })
@@ -2224,6 +2243,7 @@ impl WasmChannel {
                 let runtime = Arc::clone(&self.runtime);
                 let prepared = Arc::clone(&self.prepared);
                 let capabilities = self.capabilities.clone();
+                let workspace_store = self.workspace_store.clone();
                 let credentials = self.credentials.clone();
                 // Pre-resolve host credentials once for the lifetime of the repeater.
                 // Channels tokens rarely change, so a snapshot per-repeater is correct.
@@ -2259,6 +2279,7 @@ impl WasmChannel {
                             hc,
                             pairing_store.clone(),
                             callback_timeout,
+                            &workspace_store,
                             wit_update_clone,
                         )
                         .await
@@ -2277,63 +2298,16 @@ impl WasmChannel {
             StatusUpdate::StreamChunk(_) => {
                 // No-op, too noisy
             }
-            StatusUpdate::ApprovalNeeded {
-                tool_name,
-                description,
-                parameters,
-                allow_always,
-                ..
-            } => {
+            StatusUpdate::ApprovalNeeded { .. } => {
                 // WASM channels (Telegram, Slack, etc.) cannot render
                 // interactive approval overlays.  Send the approval prompt
                 // as an actual message so the user can reply yes/no.
                 self.cancel_typing_task().await;
 
-                let params_preview = parameters
-                    .as_object()
-                    .map(|obj| {
-                        obj.iter()
-                            .map(|(k, v)| {
-                                let val = match v {
-                                    serde_json::Value::String(s) => {
-                                        if s.chars().count() > 80 {
-                                            let truncated: String = s.chars().take(77).collect();
-                                            format!("\"{}...\"", truncated)
-                                        } else {
-                                            format!("\"{}\"", s)
-                                        }
-                                    }
-                                    other => {
-                                        let s = other.to_string();
-                                        if s.chars().count() > 80 {
-                                            let truncated: String = s.chars().take(77).collect();
-                                            format!("{}...", truncated)
-                                        } else {
-                                            s
-                                        }
-                                    }
-                                };
-                                format!("  {}: {}", k, val)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
-
-                let reply_hint = if *allow_always {
-                    "Reply \"yes\" to approve, \"no\" to deny, or \"always\" to auto-approve."
-                } else {
-                    "Reply \"yes\" to approve or \"no\" to deny."
+                let Some(prompt) = crate::channels::ChatApprovalPrompt::from_status(&status) else {
+                    return Ok(());
                 };
-                let prompt = format!(
-                    "Approval needed: {tool_name}\n\
-                     {description}\n\
-                     \n\
-                     Parameters:\n\
-                     {params_preview}\n\
-                     \n\
-                     {reply_hint}"
-                );
+                let prompt = prompt.plain_text_message();
 
                 let metadata_json = serde_json::to_string(metadata).unwrap_or_default();
                 if let Err(e) = self
@@ -3792,24 +3766,11 @@ fn status_to_wit(
                 metadata_json,
             }
         }
-        StatusUpdate::ApprovalNeeded {
-            request_id,
-            tool_name,
-            description,
-            allow_always,
-            ..
-        } => {
-            let reply_hint = if *allow_always {
-                "yes (or /approve), no (or /deny), or always (or /always)"
-            } else {
-                "yes (or /approve) or no (or /deny)"
-            };
+        StatusUpdate::ApprovalNeeded { .. } => {
+            let prompt = crate::channels::ChatApprovalPrompt::from_status(status)?;
             wit_channel::StatusUpdate {
                 status: wit_channel::StatusType::ApprovalNeeded,
-                message: format!(
-                    "Approval needed for tool '{}'. {}\nRequest ID: {}\nReply with: {}.",
-                    tool_name, description, request_id, reply_hint
-                ),
+                message: prompt.plain_text_message(),
                 metadata_json,
             }
         }
@@ -4428,6 +4389,47 @@ mod tests {
         let response = HttpResponse::error(400, "Bad request");
         assert_eq!(response.status, 400);
         assert_eq!(response.body, b"Bad request");
+    }
+
+    #[test]
+    fn test_inject_workspace_reader_adds_missing_reader() {
+        let capabilities = ChannelCapabilities::for_channel("test");
+        assert!(capabilities.tool_capabilities.workspace_read.is_none());
+
+        let workspace_store = Arc::new(crate::channels::wasm::host::ChannelWorkspaceStore::new());
+        let injected = WasmChannel::inject_workspace_reader(&capabilities, &workspace_store);
+
+        assert!(injected.tool_capabilities.workspace_read.is_some());
+        assert!(
+            injected
+                .tool_capabilities
+                .workspace_read
+                .as_ref()
+                .and_then(|cap| cap.reader.as_ref())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_inject_workspace_reader_preserves_allowed_prefixes() {
+        let tool_capabilities = crate::tools::wasm::Capabilities::default()
+            .with_workspace_read(vec!["state/".to_string(), "context/".to_string()]);
+        let capabilities =
+            ChannelCapabilities::for_channel("test").with_tool_capabilities(tool_capabilities);
+        let workspace_store = Arc::new(crate::channels::wasm::host::ChannelWorkspaceStore::new());
+
+        let injected = WasmChannel::inject_workspace_reader(&capabilities, &workspace_store);
+
+        let workspace_read = injected
+            .tool_capabilities
+            .workspace_read
+            .as_ref()
+            .expect("workspace_read capability should exist");
+        assert_eq!(
+            workspace_read.allowed_prefixes,
+            vec!["state/".to_string(), "context/".to_string()]
+        );
+        assert!(workspace_read.reader.is_some());
     }
 
     #[tokio::test]

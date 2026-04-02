@@ -25,7 +25,8 @@ use crate::history::{
     LlmCallRecord, SandboxJobRecord, SandboxJobSummary, SettingRow, Store,
 };
 use crate::workspace::{
-    MemoryChunk, MemoryDocument, Repository, SearchConfig, SearchResult, WorkspaceEntry,
+    DocumentVersion, MemoryChunk, MemoryDocument, Repository, SearchConfig, SearchResult,
+    VersionSummary, WorkspaceEntry,
 };
 
 /// PostgreSQL database backend.
@@ -99,9 +100,10 @@ impl ConversationStore for PgBackend {
         channel: &str,
         user_id: &str,
         thread_id: Option<&str>,
+        source_channel: Option<&str>,
     ) -> Result<bool, DatabaseError> {
         self.store
-            .ensure_conversation(id, channel, user_id, thread_id)
+            .ensure_conversation(id, channel, user_id, thread_id, source_channel)
             .await
     }
 
@@ -220,6 +222,15 @@ impl ConversationStore for PgBackend {
     ) -> Result<bool, DatabaseError> {
         self.store
             .conversation_belongs_to_user(conversation_id, user_id)
+            .await
+    }
+
+    async fn get_conversation_source_channel(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<String>, DatabaseError> {
+        self.store
+            .get_conversation_source_channel(conversation_id)
             .await
     }
 }
@@ -794,6 +805,69 @@ impl WorkspaceStore for PgBackend {
         self.repo
             .list_directory_multi(user_ids, agent_id, directory)
             .await
+    }
+
+    // ==================== Metadata ====================
+
+    async fn update_document_metadata(
+        &self,
+        id: Uuid,
+        metadata: &serde_json::Value,
+    ) -> Result<(), WorkspaceError> {
+        self.repo.update_document_metadata(id, metadata).await
+    }
+
+    async fn find_config_documents(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        self.repo.find_config_documents(user_id, agent_id).await
+    }
+
+    // ==================== Versioning ====================
+
+    async fn save_version(
+        &self,
+        document_id: Uuid,
+        content: &str,
+        content_hash: &str,
+        changed_by: Option<&str>,
+    ) -> Result<i32, WorkspaceError> {
+        self.repo
+            .save_version(document_id, content, content_hash, changed_by)
+            .await
+    }
+
+    async fn get_version(
+        &self,
+        document_id: Uuid,
+        version: i32,
+    ) -> Result<DocumentVersion, WorkspaceError> {
+        self.repo.get_version(document_id, version).await
+    }
+
+    async fn list_versions(
+        &self,
+        document_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<VersionSummary>, WorkspaceError> {
+        self.repo.list_versions(document_id, limit).await
+    }
+
+    async fn get_latest_version_number(
+        &self,
+        document_id: Uuid,
+    ) -> Result<Option<i32>, WorkspaceError> {
+        self.repo.get_latest_version_number(document_id).await
+    }
+
+    async fn prune_versions(
+        &self,
+        document_id: Uuid,
+        keep_count: i32,
+    ) -> Result<u64, WorkspaceError> {
+        self.repo.prune_versions(document_id, keep_count).await
     }
 }
 
