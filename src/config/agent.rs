@@ -47,6 +47,9 @@ pub struct AgentConfig {
     pub max_jobs_concurrent_per_user: Option<usize>,
     /// Drift monitor configuration.
     pub drift: DriftConfig,
+    /// Enable engine v2 routing (Strategy C parallel deployment).
+    /// Set via `ENGINE_V2=true` env var or programmatically in tests.
+    pub engine_v2: bool,
 }
 
 impl AgentConfig {
@@ -74,6 +77,7 @@ impl AgentConfig {
             multi_tenant: false,
             max_llm_concurrent_per_user: None,
             max_jobs_concurrent_per_user: None,
+            engine_v2: false,
             drift: DriftConfig::default(),
         }
     }
@@ -156,6 +160,7 @@ impl AgentConfig {
             multi_tenant: parse_bool_env("AGENT_MULTI_TENANT", false)?,
             max_llm_concurrent_per_user: parse_option_env("TENANT_MAX_LLM_CONCURRENT")?,
             max_jobs_concurrent_per_user: parse_option_env("TENANT_MAX_JOBS_CONCURRENT")?,
+            engine_v2: parse_bool_env("ENGINE_V2", false)?,
             drift: DriftConfig {
                 enabled: parse_bool_env("IRONCLAW_DRIFT_ENABLED", settings.agent.drift.enabled)?,
                 repetition_threshold: parse_optional_env(
