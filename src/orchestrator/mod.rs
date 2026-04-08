@@ -128,6 +128,8 @@ pub async fn setup_orchestrator(
             mcp_per_job_enabled: std::env::var("MCP_PER_JOB_ENABLED")
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(false),
+            claude_code_enabled: config.claude_code.enabled,
+            acp_enabled: config.acp.enabled,
         };
         let jm = Arc::new(ContainerJobManager::new(job_config, token_store.clone()));
 
@@ -139,7 +141,7 @@ pub async fn setup_orchestrator(
             prompt_queue: Arc::clone(&prompt_queue),
             store: db.cloned(),
             secrets_store: secrets_store.cloned(),
-            user_id: "default".to_string(),
+            user_id: config.owner_id.clone(),
             job_owner_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         };
 

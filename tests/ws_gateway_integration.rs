@@ -67,6 +67,7 @@ async fn start_test_server() -> (
         active_config: ironclaw::channels::web::server::ActiveConfigSnapshot::default(),
         secrets_store: None,
         db_auth: None,
+        pairing_store: None,
         oauth_providers: None,
         oauth_state_store: None,
         oauth_base_url: None,
@@ -326,6 +327,7 @@ async fn test_ws_multiple_events_in_sequence() {
     });
     state.sse.broadcast(AppEvent::ToolStarted {
         name: "shell".to_string(),
+        detail: None,
         thread_id: None,
     });
     state.sse.broadcast(AppEvent::ToolCompleted {

@@ -29,6 +29,8 @@ pub use registry::ExtensionRegistry;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 
+pub use crate::code_challenge::VerificationChallenge;
+
 /// The kind of extension, determining how it's installed, authenticated, and activated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -454,33 +456,22 @@ pub struct ActivateResult {
     pub message: String,
 }
 
-/// Result of configuring secrets for an extension.
-///
-/// Returned by `ExtensionManager::configure()`, the single entrypoint
-/// for providing secrets to any extension (chat auth, gateway setup, etc.).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerificationChallenge {
-    /// One-time code the user must send back to the integration.
-    pub code: String,
-    /// Human-readable instructions for completing verification.
-    pub instructions: String,
-    /// Deep-link or shortcut URL that prefills the verification payload when supported.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deep_link: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ConfigureResult {
     /// Human-readable status message.
     pub message: String,
     /// Whether the extension was successfully activated after configuration.
     pub activated: bool,
-    /// Whether a restart is required for the new configuration to take effect.
-    pub restart_required: bool,
+    /// Whether the channel still needs a pairing approval step before it is usable.
+    pub pairing_required: bool,
     /// OAuth authorization URL (if OAuth flow was started).
     pub auth_url: Option<String>,
-    /// Pending manual verification challenge (for Telegram owner binding, etc.).
+    /// Pending manual verification challenge, if the setup flow requires one.
     pub verification: Option<VerificationChallenge>,
+    /// Shared onboarding state for channels using guided setup/pairing.
+    pub onboarding_state: Option<crate::channels::web::types::ChannelOnboardingState>,
+    /// Shared onboarding copy/metadata for the web gateway UI.
+    pub onboarding: Option<crate::channels::web::types::ChannelOnboardingInfo>,
 }
 
 fn default_true() -> bool {
