@@ -392,7 +392,7 @@ impl LoopDelegate for ContainerDelegate {
             let mut monitor = self.drift_monitor.lock().await;
             monitor.set_iteration(iteration);
             if let Some(correction) = monitor.check_and_mark() {
-                tracing::info!(
+                tracing::debug!(
                     kind = ?correction.kind(),
                     "Drift detected in container, injecting correction"
                 );

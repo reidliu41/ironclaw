@@ -15,6 +15,9 @@
 //! Silence is counted per iteration, not per tool call. If the same
 //! iteration also has visible assistant text (`content: Some(text)`),
 //! that counts as communication and resets the silence counter.
+//! Chat iterations whose tool calls are all rejected during preflight
+//! still count as an iteration for silence accounting, even though no
+//! executed tool calls are added to drift history.
 //!
 //! ## Approval-resume limitation
 //!
@@ -81,7 +84,7 @@ impl Default for DriftConfig {
 impl DriftConfig {
     /// Clamp thresholds to safe minimums to prevent edge cases.
     pub fn clamped(mut self) -> Self {
-        self.repetition_threshold = self.repetition_threshold.max(1);
+        self.repetition_threshold = self.repetition_threshold.max(2);
         self.repetition_window = self.repetition_window.max(self.repetition_threshold);
         self.failure_spiral_threshold = self.failure_spiral_threshold.max(1);
         self.cycling_window = self.cycling_window.max(2);
@@ -222,9 +225,12 @@ impl DriftMonitor {
 
     /// Record tool calls from the current iteration.
     ///
-    /// Called once per iteration (not once per tool). Increments the
-    /// silence counter by 1 and clears suppression flags when recovery
-    /// events are detected.
+    /// Called once per iteration (not once per tool). An empty `calls`
+    /// slice is valid and means "this iteration reached tool execution
+    /// accounting, but no tool actually ran" (for example, all calls
+    /// were rejected during preflight). In all cases this increments the
+    /// silence counter by 1; non-empty slices also update drift history
+    /// and clear suppression flags when recovery events are detected.
     pub fn record_tool_calls(&mut self, calls: &[(String, u64, bool)]) {
         if !self.config.enabled {
             return;
@@ -504,6 +510,17 @@ mod tests {
         record(&mut m, "search", 42, true, 2);
 
         assert!(m.check_and_mark().is_none());
+    }
+
+    #[test]
+    fn test_repetition_threshold_clamped_to_two() {
+        let m = DriftMonitor::new(DriftConfig {
+            repetition_threshold: 1,
+            ..make_config()
+        });
+
+        assert_eq!(m.config.repetition_threshold, 2);
+        assert_eq!(m.config.repetition_window, 10);
     }
 
     #[test]
@@ -871,6 +888,27 @@ mod tests {
             m.check_and_mark().is_none(),
             "2 executed failures + 1 unrecorded rejection should not trigger spiral"
         );
+    }
+
+    /// Regression: an iteration where every tool call was rejected during
+    /// preflight must still count toward silence detection, even though no
+    /// executed tool call is recorded in drift history.
+    #[test]
+    fn test_empty_iteration_counts_toward_silence() {
+        let mut m = DriftMonitor::new(DriftConfig {
+            silence_threshold: 2,
+            ..make_config()
+        });
+
+        m.set_iteration(1);
+        m.record_tool_calls(&[]);
+        m.set_iteration(2);
+        m.record_tool_calls(&[]);
+
+        assert!(matches!(
+            m.check_and_mark(),
+            Some(DriftCorrection::SilenceDrift { iterations: 2 })
+        ));
     }
 
     /// Regression: a suppressed high-priority detector must block lower-priority

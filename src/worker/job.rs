@@ -1373,7 +1373,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
             let mut monitor = self.drift_monitor.lock().await;
             monitor.set_iteration(iteration);
             if let Some(correction) = monitor.check_and_mark() {
-                tracing::info!(
+                tracing::debug!(
                     job_id = %self.worker.job_id,
                     kind = ?correction.kind(),
                     "Drift detected in job, injecting correction"

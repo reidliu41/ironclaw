@@ -321,7 +321,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             let mut monitor = self.drift_monitor.lock().await;
             monitor.set_iteration(iteration);
             if let Some(correction) = monitor.check_and_mark() {
-                tracing::info!(
+                tracing::debug!(
                     kind = ?correction.kind(),
                     "Drift detected, injecting correction"
                 );
@@ -1063,13 +1063,14 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             }
         }
 
-        // Record tool calls in drift monitor
-        if !drift_records.is_empty() {
-            let mut monitor = self.drift_monitor.lock().await;
-            monitor.record_tool_calls(&drift_records);
-            if has_nonempty_content {
-                monitor.record_communication();
-            }
+        // Record this tool-iteration in the drift monitor even when every
+        // tool call was rejected during preflight. Rejections do not enter
+        // drift history, but the iteration still matters for silence
+        // accounting; visible narrative still resets the silence counter.
+        let mut monitor = self.drift_monitor.lock().await;
+        monitor.record_tool_calls(&drift_records);
+        if has_nonempty_content {
+            monitor.record_communication();
         }
 
         // Return auth response after all results are recorded
