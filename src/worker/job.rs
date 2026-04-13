@@ -62,6 +62,8 @@ pub struct WorkerDeps {
     pub http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
     /// Drift monitor configuration (propagated from AgentConfig).
     pub drift_config: crate::agent::drift_monitor::DriftConfig,
+    /// Whether the deployment is multi-tenant (used for admin tool policy filtering).
+    pub multi_tenant: bool,
 }
 
 /// Worker that executes a single job.
@@ -400,6 +402,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             drift_monitor: tokio::sync::Mutex::new(DriftMonitor::new(
                 self.deps.drift_config.clone(),
             )),
+            cached_user_info: tokio::sync::OnceCell::new(),
+            cached_admin_tool_policy: tokio::sync::OnceCell::new(),
         };
 
         let config = AgenticLoopConfig {
@@ -424,7 +428,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             LoopOutcome::Stopped => {
                 // Stop signal handled — nothing more to do
             }
-            LoopOutcome::NeedApproval(_) => {}
+            LoopOutcome::NeedApproval(_) | LoopOutcome::AuthPending(_) => {}
         }
 
         Ok(())
@@ -1179,10 +1183,53 @@ struct JobDelegate<'a> {
     /// rather than a retry signal (prevents spurious failures in routines).
     has_text_response: std::sync::atomic::AtomicBool,
     drift_monitor: tokio::sync::Mutex<DriftMonitor>,
+    /// Cached (user_id, is_admin) for admin tool policy filtering. Populated once
+    /// on first access to avoid repeated DB lookups.
+    cached_user_info: tokio::sync::OnceCell<(String, bool)>,
+    /// Cached admin tool policy result for this worker loop.
+    cached_admin_tool_policy: crate::tools::permissions::AdminToolPolicyCache,
 }
 
 impl<'a> JobDelegate<'a> {
     const MAX_CONSECUTIVE_RATE_LIMITS: usize = 10;
+
+    /// Resolve and cache (user_id, is_admin) for admin tool policy filtering.
+    ///
+    /// Reads the job's `user_id` from the context manager and looks up the
+    /// user's role from the database. Falls back to `false` when the DB
+    /// lookup fails or no store is configured (safe default: non-admin users
+    /// still see the filtered tool list).
+    async fn resolve_user_info(&self) -> &(String, bool) {
+        self.cached_user_info
+            .get_or_init(|| async {
+                let user_id = self
+                    .worker
+                    .context_manager()
+                    .get_context(self.worker.job_id)
+                    .await
+                    .map(|ctx| ctx.user_id.clone())
+                    .unwrap_or_default();
+
+                let is_admin = if let Some(store) = self.worker.store() {
+                    match store.get_user_role(&user_id).await {
+                        Ok(Some(role)) => role.is_admin(),
+                        Ok(None) => false,
+                        Err(e) => {
+                            tracing::debug!(
+                                job_id = %self.worker.job_id,
+                                "Failed to look up user role, defaulting to non-admin: {e}"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                (user_id, is_admin)
+            })
+            .await
+    }
 
     /// Handle a rate-limit error: back off, increment counter, and fail fast
     /// if the provider remains rate-limited for too many consecutive attempts.
@@ -1398,7 +1445,42 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
             reason_ctx.available_tools.clear();
         } else {
             // Refresh tool definitions so newly built tools become visible
-            reason_ctx.available_tools = self.worker.tools().tool_definitions().await;
+            let tool_defs = self.worker.tools().tool_definitions().await;
+
+            // Apply admin tool policy filtering (multi-tenant only).
+            let (user_id, is_admin) = self.resolve_user_info().await;
+            let admin_policy = self
+                .cached_admin_tool_policy
+                .get_or_init(|| async {
+                    let Some(store) = self.worker.store() else {
+                        return crate::tools::permissions::AdminToolPolicyState::Missing;
+                    };
+
+                    match store.get_admin_tool_policy().await {
+                        Ok(Some(policy)) => {
+                            crate::tools::permissions::AdminToolPolicyState::Loaded(policy)
+                        }
+                        Ok(None) => crate::tools::permissions::AdminToolPolicyState::Missing,
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = %self.worker.job_id,
+                                %error,
+                                "Failed to load admin tool policy for worker, failing closed"
+                            );
+                            crate::tools::permissions::AdminToolPolicyState::FailClosed
+                        }
+                    }
+                })
+                .await;
+            let tool_defs = crate::tools::permissions::filter_admin_disabled_tools(
+                tool_defs,
+                self.worker.deps.multi_tenant,
+                *is_admin,
+                user_id,
+                admin_policy,
+            );
+
+            reason_ctx.available_tools = tool_defs;
         }
 
         // Claude 4.6 rejects assistant prefill; NEAR AI rejects any non-user-ending
@@ -1680,6 +1762,8 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
 
         // Execute tools (parallel for multiple, direct for single)
         let mut drift_records: Vec<(String, u64, bool)> = Vec::with_capacity(selections.len());
+        let mut tool_failure_count: usize = 0;
+        let total_tools = selections.len();
 
         if selections.len() == 1 {
             let selection = &selections[0];
@@ -1688,6 +1772,9 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
                 .execute_tool(&selection.tool_name, &selection.parameters)
                 .await;
             let succeeded = result.is_ok();
+            if result.is_err() {
+                tool_failure_count += 1;
+            }
             self.worker
                 .process_tool_result_job(reason_ctx, selection, result)
                 .await?;
@@ -1700,6 +1787,9 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
             let results = self.worker.execute_tools_parallel(&selections).await;
             for (selection, result) in selections.iter().zip(results) {
                 let succeeded = result.result.is_ok();
+                if result.result.is_err() {
+                    tool_failure_count += 1;
+                }
                 self.worker
                     .process_tool_result_job(reason_ctx, selection, result.result)
                     .await?;
@@ -1719,6 +1809,9 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
                 monitor.record_communication();
             }
         }
+
+        reason_ctx.last_tool_batch_all_failed =
+            total_tools > 0 && tool_failure_count == total_tools;
 
         Ok(None)
     }
@@ -1874,6 +1967,7 @@ mod tests {
             approval_context: None,
             http_interceptor: None,
             drift_config: crate::agent::drift_monitor::DriftConfig::default(),
+            multi_tenant: false,
         };
 
         Worker::new(job_id, deps)
@@ -2094,6 +2188,7 @@ mod tests {
             approval_context,
             http_interceptor: None,
             drift_config: crate::agent::drift_monitor::DriftConfig::default(),
+            multi_tenant: false,
         };
 
         Worker::new(job_id, deps)
@@ -2454,6 +2549,8 @@ mod tests {
             recovery_state: tokio::sync::Mutex::new(AutonomousRecoveryState::default()),
             has_text_response: std::sync::atomic::AtomicBool::new(false),
             drift_monitor: tokio::sync::Mutex::new(DriftMonitor::disabled()),
+            cached_user_info: tokio::sync::OnceCell::new(),
+            cached_admin_tool_policy: tokio::sync::OnceCell::new(),
         };
 
         let mut reason_ctx = ReasoningContext::new();
@@ -2817,6 +2914,8 @@ mod tests {
             has_text_response: std::sync::atomic::AtomicBool::new(false),
             drift_monitor: tokio::sync::Mutex::new(DriftMonitor::new(drift_config)),
             recovery_state: tokio::sync::Mutex::new(AutonomousRecoveryState::default()),
+            cached_user_info: tokio::sync::OnceCell::new(),
+            cached_admin_tool_policy: tokio::sync::OnceCell::new(),
         };
 
         // Prime the monitor: 1 iteration of tool calls so silence counter = 1

@@ -314,6 +314,7 @@ impl Scheduler {
                 approval_context,
                 http_interceptor: self.http_interceptor.clone(),
                 drift_config: self.config.drift.clone(),
+                multi_tenant: self.config.multi_tenant,
             };
             let worker = Worker::new(job_id, deps);
 
