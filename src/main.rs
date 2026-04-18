@@ -15,8 +15,8 @@ use ironclaw::{
         web::log_layer::LogBroadcaster,
     },
     cli::{
-        Cli, Command, run_mcp_command, run_pairing_command, run_service_command,
-        run_status_command, run_tool_command,
+        Cli, Command, run_mcp_command, run_pairing_command, run_profile_command,
+        run_service_command, run_status_command, run_tool_command,
     },
     config::Config,
     hooks::bootstrap_hooks,
@@ -85,7 +85,7 @@ fn format_top_level_error(err: &anyhow::Error) {
 
 /// Returns `true` when non-CLI network services should be enabled.
 /// `--cli-only` suppresses all of them: webhooks, WASM channels, HTTP,
-/// Signal, gateway, managed tunnel, and sandbox orchestrator API.
+/// Signal, relay channels, gateway, managed tunnel, and sandbox orchestrator API.
 fn non_cli_channels_enabled(cli_only: bool) -> bool {
     !cli_only
 }
@@ -130,7 +130,11 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Command::Pairing(pairing_cmd)) => {
             init_cli_tracing();
-            return run_pairing_command(pairing_cmd.clone()).map_err(|e| anyhow::anyhow!("{}", e));
+            return run_pairing_command(pairing_cmd.clone()).await;
+        }
+        Some(Command::Profile(profile_cmd)) => {
+            init_cli_tracing();
+            return run_profile_command(profile_cmd.clone()).await;
         }
         Some(Command::Service(service_cmd)) => {
             init_cli_tracing();
@@ -350,8 +354,12 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Initialize tracing with a reloadable EnvFilter so the gateway can switch
     // log levels at runtime without restarting.
-    let log_level_handle =
-        ironclaw::channels::web::log_layer::init_tracing(Arc::clone(&log_broadcaster));
+    let suppress_stderr =
+        config.channels.tui.is_some() && cli.message.is_none() && cfg!(feature = "tui");
+    let log_level_handle = ironclaw::channels::web::log_layer::init_tracing(
+        Arc::clone(&log_broadcaster),
+        suppress_stderr,
+    );
 
     tracing::debug!("Starting IronClaw...");
     tracing::debug!("Loaded configuration for agent: {}", config.agent.name);
@@ -435,13 +443,128 @@ async fn async_main() -> anyhow::Result<()> {
         Arc<WasmChannelRouter>,
     )> = None;
 
-    // Create CLI channel
+    // Create CLI channel (REPL or TUI — mutually exclusive, both claim stdin)
+    let tui_mode = config.channels.tui.is_some();
+
+    #[cfg(feature = "tui")]
+    if tui_mode && cli.message.is_none() {
+        let tool_names = components.tools.list().await;
+        let tool_categories = ironclaw::channels::tui::group_tools_by_prefix(tool_names);
+
+        let skill_categories = if let Some(ref registry) = components.skill_registry {
+            let registry = registry.read().unwrap_or_else(|e| e.into_inner());
+            let skill_data: Vec<(String, Vec<String>)> = registry
+                .skills()
+                .iter()
+                .map(|s| (s.manifest.name.clone(), s.manifest.activation.tags.clone()))
+                .collect();
+            ironclaw::channels::tui::group_skills_by_tag(&skill_data)
+        } else {
+            Vec::new()
+        };
+
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::new());
+        let workspace_path = workspace_root.display().to_string();
+        let layout = if let Some(ref tui_config) = config.channels.tui {
+            ironclaw::channels::tui::resolve_tui_layout(tui_config, &workspace_root)
+        } else {
+            ironclaw_tui::TuiLayout::default()
+        };
+
+        let (memory_count, identity_files) = if let Some(ref ws) = components.workspace {
+            let count = ws.list_all().await.map(|docs| docs.len()).unwrap_or(0);
+            let identity_names = ["AGENTS.md", "SOUL.md", "USER.md", "IDENTITY.md"];
+            let mut found = Vec::new();
+            for name in &identity_names {
+                if ws.read(name).await.is_ok() {
+                    found.push((*name).to_string());
+                }
+            }
+            (count, found)
+        } else {
+            (0, Vec::new())
+        };
+
+        let current_model = components.llm.model_name().to_string();
+        let context_window =
+            match tokio::time::timeout(Duration::from_secs(5), components.llm.model_metadata())
+                .await
+            {
+                Ok(Ok(metadata)) => metadata.context_length.map(u64::from),
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        "TUI context metadata unavailable: could not fetch model metadata: {}",
+                        e
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!("TUI context metadata unavailable: model metadata timed out");
+                    None
+                }
+            };
+        let available_models = match tokio::time::timeout(
+            Duration::from_secs(5),
+            components.llm.list_models(),
+        )
+        .await
+        {
+            Ok(Ok(mut models)) if !models.is_empty() => {
+                if let Some(pos) = models.iter().position(|m| m == &current_model) {
+                    if pos != 0 {
+                        let current = models.remove(pos);
+                        models.insert(0, current);
+                    }
+                } else {
+                    models.insert(0, current_model.clone());
+                }
+                models
+            }
+            Ok(Ok(_)) => Vec::new(),
+            Ok(Err(e)) => {
+                tracing::debug!("TUI model picker unavailable: could not list models: {}", e);
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::debug!("TUI model picker unavailable: model discovery timed out");
+                Vec::new()
+            }
+        };
+
+        let tui_channel = ironclaw::channels::TuiChannel::new(
+            config.owner_id.clone(),
+            env!("CARGO_PKG_VERSION"),
+            current_model,
+        )
+        .with_context_window(context_window.unwrap_or(128_000))
+        .with_layout(layout)
+        .with_log_broadcaster(Arc::clone(&log_broadcaster))
+        .with_tools(tool_categories)
+        .with_skills(skill_categories)
+        .with_workspace_path(workspace_path)
+        .with_memory_count(memory_count)
+        .with_identity_files(identity_files)
+        .with_available_models(available_models);
+
+        channels.add(Box::new(tui_channel)).await;
+        channel_names.push("tui".to_string());
+        tracing::debug!("TUI mode enabled");
+    }
+
+    #[cfg(not(feature = "tui"))]
+    if tui_mode {
+        tracing::warn!(
+            "CLI_MODE=tui requested but the 'tui' feature is not enabled. Falling back to REPL."
+        );
+    }
+
+    let use_repl = !tui_mode || cfg!(not(feature = "tui"));
     let repl_channel = if let Some(ref msg) = cli.message {
         Some(ReplChannel::with_message_for_user(
             config.owner_id.clone(),
             msg.clone(),
         ))
-    } else if config.channels.cli.enabled {
+    } else if use_repl && config.channels.cli.enabled {
         let repl = ReplChannel::with_user_id(config.owner_id.clone());
         repl.suppress_banner();
         Some(repl)
@@ -498,6 +621,7 @@ async fn async_main() -> anyhow::Result<()> {
             components.extension_manager.as_ref(),
             components.db.as_ref(),
             &channel_names,
+            Arc::clone(&components.ownership_cache),
         )
         .await;
 
@@ -520,7 +644,11 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Add Signal channel if configured and not CLI-only mode.
     if enable_non_cli && let Some(ref signal_config) = config.channels.signal {
-        let signal_channel = SignalChannel::new(signal_config.clone())?;
+        let signal_channel = SignalChannel::new(
+            signal_config.clone(),
+            components.db.clone(),
+            Arc::clone(&components.ownership_cache),
+        )?;
         channel_names.push("signal".to_string());
         channels.add(Box::new(signal_channel)).await;
         let safe_url = SignalChannel::redact_url(&signal_config.http_url);
@@ -615,7 +743,8 @@ async fn async_main() -> anyhow::Result<()> {
     let scheduler_slot: ironclaw::tools::builtin::SchedulerSlot =
         Arc::new(tokio::sync::RwLock::new(None));
 
-    // Register job tools (sandbox deps auto-injected when container_job_manager is available)
+    // Register job tools even under --cli-only so scheduler-backed jobs remain available.
+    // Sandbox-only dependencies are injected only when the container manager is running.
     components.tools.register_job_tools(
         Arc::clone(&components.context_manager),
         Some(scheduler_slot.clone()),
@@ -659,6 +788,14 @@ async fn async_main() -> anyhow::Result<()> {
         gw = gw.with_log_broadcaster(Arc::clone(&log_broadcaster));
         gw = gw.with_log_level_handle(Arc::clone(&log_level_handle));
         gw = gw.with_tool_registry(Arc::clone(&components.tools));
+        if let Some(ref db) = components.db {
+            let dispatcher = Arc::new(ironclaw::tools::dispatch::ToolDispatcher::new(
+                Arc::clone(&components.tools),
+                Arc::clone(&components.safety),
+                Arc::clone(db),
+            ));
+            gw = gw.with_tool_dispatcher(dispatcher);
+        }
         if let Some(ref ext_mgr) = components.extension_manager {
             // Enable gateway mode so MCP OAuth returns auth URLs to the frontend
             // instead of calling open::that() on the server.
@@ -666,7 +803,7 @@ async fn async_main() -> anyhow::Result<()> {
                 .tunnel
                 .public_url
                 .clone()
-                .unwrap_or_else(|| format!("http://{}:{}", gw_config.host, gw_config.port));
+                .unwrap_or_else(|| oauth_base_url(&gw_config.host, gw_config.port));
             ext_mgr.enable_gateway_mode(gw_base).await;
             gw = gw.with_extension_manager(Arc::clone(ext_mgr));
         }
@@ -676,6 +813,11 @@ async fn async_main() -> anyhow::Result<()> {
         if let Some(ref d) = components.db {
             gw = gw.with_store(Arc::clone(d));
             gw = gw.with_db_auth(Arc::clone(d));
+            let pairing_store = Arc::new(ironclaw::pairing::PairingStore::new(
+                Arc::clone(d),
+                Arc::clone(&components.ownership_cache),
+            ));
+            gw = gw.with_pairing_store(pairing_store);
             if let Some(ref ss) = components.secrets_store {
                 gw = gw.with_secrets_store(Arc::clone(ss));
             }
@@ -911,12 +1053,38 @@ async fn async_main() -> anyhow::Result<()> {
             {
                 continue;
             }
-            match ext_mgr.activate(name, &ext_user_id).await {
-                Ok(result) => {
+            match ext_mgr
+                .ensure_extension_ready(
+                    name,
+                    &ext_user_id,
+                    ironclaw::extensions::EnsureReadyIntent::ExplicitActivate,
+                )
+                .await
+            {
+                Ok(ironclaw::extensions::EnsureReadyOutcome::Ready { activation, .. }) => {
+                    let message = activation
+                        .map(|result| result.message)
+                        .unwrap_or_else(|| format!("Channel '{}' already ready", name));
                     tracing::debug!(
                         channel = %name,
-                        message = %result.message,
+                        message = %message,
                         "Auto-activated persisted WASM channel"
+                    );
+                }
+                Ok(ironclaw::extensions::EnsureReadyOutcome::NeedsAuth { auth, .. }) => {
+                    tracing::warn!(
+                        channel = %name,
+                        instructions = ?auth.instructions(),
+                        "Persisted WASM channel still needs authentication"
+                    );
+                }
+                Ok(ironclaw::extensions::EnsureReadyOutcome::NeedsSetup {
+                    instructions, ..
+                }) => {
+                    tracing::warn!(
+                        channel = %name,
+                        instructions = %instructions,
+                        "Persisted WASM channel still needs setup"
                     );
                 }
                 Err(e) => {
@@ -930,9 +1098,9 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
-    // Ensure the relay channel manager is always set (even without WASM runtime),
-    // then restore any persisted relay channels.
-    if let Some(ref ext_mgr) = components.extension_manager {
+    // Relay restoration can make outbound relay calls and hot-add live channels.
+    // Suppress it under --cli-only along with other non-CLI channel activation paths.
+    if enable_non_cli && let Some(ref ext_mgr) = components.extension_manager {
         ext_mgr
             .set_relay_channel_manager(Arc::clone(&channels))
             .await;
@@ -958,19 +1126,44 @@ async fn async_main() -> anyhow::Result<()> {
         recorder.snapshot_memory(ws).await;
     }
 
-    let http_interceptor = components
-        .recording_handle
-        .as_ref()
-        .map(|r| r.http_interceptor());
+    let http_interceptor = ironclaw::http_intercept::chain(
+        [
+            components.http_interceptor.clone(),
+            components
+                .recording_handle
+                .as_ref()
+                .map(|r| r.http_interceptor()),
+        ]
+        .into_iter()
+        .flatten(),
+    );
     // Clone context_manager for the reaper before it's moved into Agent::new()
     let reaper_context_manager = Arc::clone(&components.context_manager);
 
-    // Capture db reference for SIGHUP handler before it's moved into AgentDeps (Unix only)
+    // Capture settings store for SIGHUP handler before AppComponents is consumed.
+    // Prefer the workspace-backed adapter (so SIGHUP-driven config reloads pick
+    // up settings written through the workspace) and fall back to the raw db
+    // when no workspace is configured.
     #[cfg(unix)]
     let sighup_settings_store: Option<Arc<dyn ironclaw::db::SettingsStore>> = components
-        .db
+        .settings_store
         .as_ref()
-        .map(|db| Arc::clone(db) as Arc<dyn ironclaw::db::SettingsStore>);
+        .map(|s| Arc::clone(s) as Arc<dyn ironclaw::db::SettingsStore>)
+        .or_else(|| {
+            components
+                .db
+                .as_ref()
+                .map(|db| Arc::clone(db) as Arc<dyn ironclaw::db::SettingsStore>)
+        });
+
+    let auth_manager = components.tools.secrets_store().cloned().map(|secrets| {
+        Arc::new(ironclaw::bridge::auth_manager::AuthManager::new(
+            secrets,
+            components.skill_registry.clone(),
+            components.extension_manager.clone(),
+            Some(Arc::clone(&components.tools)),
+        ))
+    });
 
     let deps = AgentDeps {
         owner_id: config.owner_id.clone(),
@@ -985,6 +1178,7 @@ async fn async_main() -> anyhow::Result<()> {
         skill_catalog: components.skill_catalog,
         skills_config: config.skills.clone(),
         hooks: components.hooks,
+        auth_manager,
         cost_guard: components.cost_guard,
         sse_tx: sse_manager,
         http_interceptor,
@@ -1283,9 +1477,25 @@ async fn async_main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build the OAuth base URL from the gateway bind address and port.
+///
+/// Unspecified addresses (`0.0.0.0`, `::`, `[::]`) are mapped to `localhost`
+/// because they are valid bind addresses but not valid OAuth redirect hosts.
+fn oauth_base_url(host: &str, port: u16) -> String {
+    let trimmed = host.trim_start_matches('[').trim_end_matches(']');
+    let is_unspecified = trimmed
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified());
+    if is_unspecified {
+        format!("http://localhost:{}", port)
+    } else {
+        format!("http://{}:{}", host, port)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::non_cli_channels_enabled;
+    use super::*;
 
     /// Regression test for <https://github.com/nearai/ironclaw/issues/1840>:
     /// `--cli-only` must suppress webhook server and all non-CLI channels.
@@ -1301,6 +1511,74 @@ mod tests {
         );
     }
 
+    fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+        haystack
+            .get(from..)?
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .map(|pos| from + pos)
+    }
+
+    fn is_ident_byte(byte: u8) -> bool {
+        byte == b'_' || byte.is_ascii_alphanumeric()
+    }
+
+    fn is_ident_at(source: &[u8], ident: &[u8], pos: usize) -> bool {
+        let before = pos.checked_sub(1).and_then(|idx| source.get(idx).copied());
+        let after = source.get(pos + ident.len()).copied();
+        !before.is_some_and(is_ident_byte) && !after.is_some_and(is_ident_byte)
+    }
+
+    fn matching_close_brace(source: &[u8], open_pos: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (idx, byte) in source[open_pos..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(open_pos + idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn next_guard_block_start(source: &[u8], guard_pos: usize) -> Option<usize> {
+        let mut cursor = guard_pos + b"enable_non_cli".len();
+        while let Some(byte) = source.get(cursor) {
+            match byte {
+                b'{' => return Some(cursor),
+                b';' | b'}' => return None,
+                _ => cursor += 1,
+            }
+        }
+        None
+    }
+
+    fn is_inside_enable_non_cli_block(source: &[u8], pos: usize) -> bool {
+        let mut search_from = 0;
+        while let Some(guard_pos) = find_bytes(source, b"enable_non_cli", search_from) {
+            if guard_pos >= pos {
+                return false;
+            }
+
+            if is_ident_at(source, b"enable_non_cli", guard_pos)
+                && let Some(open_pos) = next_guard_block_start(source, guard_pos)
+                && open_pos < pos
+                && let Some(close_pos) = matching_close_brace(source, open_pos)
+                && pos < close_pos
+            {
+                return true;
+            }
+
+            search_from = guard_pos + b"enable_non_cli".len();
+        }
+        false
+    }
+
     /// Source-level guard: every network-facing startup call in `async_main`
     /// must be gated behind `enable_non_cli`.  If someone adds a new channel
     /// or tunnel call without the guard, this test fails.
@@ -1308,17 +1586,16 @@ mod tests {
     /// Regression coverage for <https://github.com/nearai/ironclaw/issues/1840>.
     #[test]
     fn all_non_cli_ingress_paths_are_guarded() {
-        let source = include_str!("main.rs");
+        let source = include_str!("main.rs").as_bytes();
 
         // Extract the body of async_main (from its signature to the end of file,
-        // minus the test module).  Good enough for a structural grep.
-        let async_main_body = source
-            .split_once("async fn async_main(")
-            .expect("async_main not found")
-            .1;
-        let async_main_body = async_main_body
-            .split_once("#[cfg(test)]")
-            .map_or(async_main_body, |(body, _)| body);
+        // minus the test module). Keep this byte-based to avoid UTF-8 boundary
+        // panics when checking source offsets.
+        let async_main_start =
+            find_bytes(source, b"async fn async_main(", 0).expect("async_main not found");
+        let async_main_end =
+            find_bytes(source, b"#[cfg(test)]", async_main_start).unwrap_or(source.len());
+        let async_main_body = &source[async_main_start..async_main_end];
 
         // Calls that MUST be behind an `enable_non_cli` guard.
         // When adding a new channel, tunnel, or network-facing service,
@@ -1331,26 +1608,45 @@ mod tests {
             "HttpChannel::new(",
             "GatewayChannel::new(",
             "start_managed_tunnel(",
+            "set_relay_channel_manager(",
+            "restore_relay_channels(&",
         ];
 
         for call in guarded_calls {
-            // Find every occurrence of the call and verify that `enable_non_cli`
-            // appears in the preceding 500 chars (i.e. the enclosing `if` block).
+            let call = call.as_bytes();
             let mut search_from = 0;
-            while let Some(pos) = async_main_body[search_from..].find(call) {
-                let abs = search_from + pos;
-                let window_start = abs.saturating_sub(500);
-                let window = &async_main_body[window_start..abs];
+            while let Some(abs) = find_bytes(async_main_body, call, search_from) {
                 assert!(
-                    window.contains("enable_non_cli"),
-                    "Network ingress call `{}` at byte offset {} in async_main is not \
-                     guarded by `enable_non_cli`. Every non-CLI startup path must check \
+                    is_inside_enable_non_cli_block(async_main_body, abs),
+                    "Network ingress call `{}` at byte offset {} in async_main is not inside \
+                     a brace-delimited `enable_non_cli` block. Every non-CLI startup path must check \
                      this flag (issue #1840).",
-                    call,
+                    String::from_utf8_lossy(call),
                     abs,
                 );
                 search_from = abs + call.len();
             }
         }
+    }
+
+    #[test]
+    fn oauth_base_url_maps_unspecified_to_localhost() {
+        assert_eq!(oauth_base_url("0.0.0.0", 3033), "http://localhost:3033");
+        assert_eq!(oauth_base_url("::", 3033), "http://localhost:3033");
+        assert_eq!(oauth_base_url("[::]", 3033), "http://localhost:3033");
+        assert_eq!(
+            oauth_base_url("0:0:0:0:0:0:0:0", 3033),
+            "http://localhost:3033"
+        );
+    }
+
+    #[test]
+    fn oauth_base_url_preserves_explicit_host() {
+        assert_eq!(oauth_base_url("127.0.0.1", 3000), "http://127.0.0.1:3000");
+        assert_eq!(
+            oauth_base_url("my-server.example.com", 8080),
+            "http://my-server.example.com:8080"
+        );
+        assert_eq!(oauth_base_url("::1", 3000), "http://::1:3000");
     }
 }

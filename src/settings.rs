@@ -150,6 +150,12 @@ pub struct Settings {
     #[serde(default)]
     pub selected_model: Option<String>,
 
+    /// Default sampling temperature for LLM requests (0.0–2.0).
+    /// When set, used as the default for conversational turns.
+    /// Per-request temperature (e.g. from the API) takes precedence.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+
     // === Step 5: Embeddings ===
     /// Embeddings configuration.
     #[serde(default)]
@@ -220,6 +226,15 @@ pub struct Settings {
     /// Transcription configuration.
     #[serde(default)]
     pub transcription: Option<TranscriptionSettings>,
+
+    /// Per-tool permission overrides.
+    ///
+    /// Keys are tool names; values override the built-in tier defaults from
+    /// `TOOL_RISK_DEFAULTS`.  Absent tools fall back to the tier default, or
+    /// `AskEachTime` if the tool is unknown.
+    #[serde(default)]
+    pub tool_permissions:
+        std::collections::HashMap<String, crate::tools::permissions::PermissionState>,
 }
 
 /// Source for the secrets master key.
@@ -408,6 +423,10 @@ pub struct ChannelSettings {
     /// Directory containing WASM channel modules.
     #[serde(default)]
     pub wasm_channels_dir: Option<PathBuf>,
+
+    /// CLI mode: "tui" for rich terminal UI, empty/absent for simple REPL.
+    #[serde(default)]
+    pub cli_mode: Option<String>,
 }
 
 impl Default for ChannelSettings {
@@ -433,6 +452,7 @@ impl Default for ChannelSettings {
             wasm_channels: Vec::new(),
             wasm_channels_enabled: true,
             wasm_channels_dir: None,
+            cli_mode: Some("tui".to_string()),
         }
     }
 }
